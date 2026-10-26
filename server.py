@@ -14,12 +14,16 @@ The API is documented in ``backend/README.md``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import mimetypes
+import re
 import threading
 import time
 import uuid
+import zipfile
+from io import BytesIO
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
@@ -52,6 +56,8 @@ TEXT_EXTENSIONS = {".md", ".markdown", ".csv", ".txt", ".json"}
 
 UPLOADS: Dict[str, Dict[str, Any]] = {}
 UPLOADS_BY_KB: Dict[str, List[str]] = {}
+CHUNKS: Dict[str, Dict[str, Any]] = {}
+LOGS: List[Dict[str, Any]] = []
 STATE_LOCK = threading.RLock()
 
 
@@ -120,6 +126,113 @@ def status_label(status: str) -> str:
     }.get(status, status)
 
 
+def extract_document_text(filename: str, payload: bytes) -> Tuple[str, Dict[str, Any]]:
+    """Extract a useful local text representation without third-party packages.
+
+    This is intentionally an adapter boundary: production can replace it with
+    OCR/vision and layout parsers while keeping the RAG pipeline unchanged.
+    """
+    ext = extension_for(filename)
+    if ext in TEXT_EXTENSIONS:
+        return payload.decode("utf-8", errors="replace").strip(), {"source_type": "text"}
+    if ext == ".docx":
+        try:
+            with zipfile.ZipFile(BytesIO(payload)) as archive:
+                xml = archive.read("word/document.xml").decode("utf-8", errors="replace")
+            text = re.sub(r"</w:p>", "\n", xml)
+            text = re.sub(r"<w:tab[^>]*/>", "\t", text)
+            text = re.sub(r"<[^>]+>", "", text)
+            return re.sub(r"\n{3,}", "\n\n", text).strip(), {"source_type": "docx"}
+        except Exception:
+            return "Word 文档已上传，模拟解析器未能读取其 XML 内容。", {"source_type": "docx"}
+    if ext == ".xlsx":
+        try:
+            with zipfile.ZipFile(BytesIO(payload)) as archive:
+                shared = []
+                if "xl/sharedStrings.xml" in archive.namelist():
+                    raw = archive.read("xl/sharedStrings.xml").decode("utf-8", errors="replace")
+                    shared = re.findall(r"<t[^>]*>(.*?)</t>", raw)
+                sheets = [name for name in archive.namelist() if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")]
+                rows: List[str] = []
+                for sheet in sorted(sheets):
+                    raw = archive.read(sheet).decode("utf-8", errors="replace")
+                    for row in re.findall(r"<row[^>]*>(.*?)</row>", raw, flags=re.S):
+                        values = []
+                        for cell_type, value in re.findall(r"<c[^>]*?(?:t=\"([^\"]+)\")?[^>]*>.*?<v>(.*?)</v>.*?</c>", row, flags=re.S):
+                            value = re.sub(r"<[^>]+>", "", value)
+                            if cell_type == "s" and value.isdigit() and int(value) < len(shared):
+                                value = shared[int(value)]
+                            values.append(value)
+                        if values:
+                            rows.append(" | ".join(values))
+                return "\n".join(rows).strip(), {"source_type": "xlsx"}
+        except Exception:
+            return "表格已上传，模拟解析器未能读取其工作表内容。", {"source_type": "xlsx"}
+    if ext == ".pdf":
+        # Basic extraction for text PDFs; scanned PDFs use the OCR placeholder.
+        decoded = payload.decode("latin-1", errors="ignore")
+        strings = re.findall(r"\(([^()]*)\)", decoded)
+        text = "\n".join(item for item in strings if len(item.strip()) > 2)
+        return text.strip() or "扫描 PDF 已接收，模拟 OCR 已将页面标记为可检索内容。", {"source_type": "pdf", "page": 1}
+    if ext in {".png", ".jpg", ".jpeg", ".webp"}:
+        return "图片已接收，模拟 OCR 文本：请在此替换为云端 OCR 返回的识别结果。", {"source_type": "ocr", "page": 1}
+    return "文件已接收并完成模拟解析。", {"source_type": "generic"}
+
+
+def chunk_text(text: str, max_chars: int = 500, overlap: int = 60) -> List[str]:
+    clean = re.sub(r"\n{3,}", "\n\n", text or "").strip()
+    if not clean:
+        return ["文档没有可提取的文字内容。"]
+    chunks: List[str] = []
+    start = 0
+    while start < len(clean):
+        end = min(len(clean), start + max_chars)
+        if end < len(clean):
+            boundary = max(clean.rfind("\n", start, end), clean.rfind("。", start, end), clean.rfind(" ", start, end))
+            if boundary > start + max_chars // 2:
+                end = boundary + 1
+        chunks.append(clean[start:end].strip())
+        if end >= len(clean):
+            break
+        start = max(start + 1, end - overlap)
+    return chunks
+
+
+def tokenize(text: str) -> List[str]:
+    return [item.lower() for item in re.findall(r"[\u4e00-\u9fff]|[a-zA-Z0-9_]+", text or "")]
+
+
+def embedding(text: str, dimensions: int = 64) -> List[float]:
+    vector = [0.0] * dimensions
+    for token in tokenize(text):
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:4], "big") % dimensions
+        vector[index] += 1.0 if digest[4] % 2 else -1.0
+    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+    return [value / norm for value in vector]
+
+
+def cosine(left: List[float], right: List[float]) -> float:
+    return sum(a * b for a, b in zip(left, right))
+
+
+def build_chunks(record: Dict[str, Any], text: str, metadata: Dict[str, Any]) -> None:
+    pieces = chunk_text(text)
+    for index, piece in enumerate(pieces):
+        chunk_id = f"chk_{uuid.uuid4().hex[:16]}"
+        CHUNKS[chunk_id] = {
+            "id": chunk_id,
+            "document_id": record["id"],
+            "knowledge_base_id": record["knowledge_base_id"],
+            "text": piece,
+            "embedding": embedding(piece),
+            "index": index,
+            "source": {"name": record["filename"], "page": metadata.get("page", index + 1), "sheet": metadata.get("sheet")},
+        }
+    record["chunks"] = len(pieces)
+    record["preview"] = text[:240] if text else None
+
+
 def extract_text_chunks(filename: str, payload: bytes) -> Tuple[int, Optional[str]]:
     """Perform the smallest useful local extraction simulation.
 
@@ -128,30 +241,8 @@ def extract_text_chunks(filename: str, payload: bytes) -> Tuple[int, Optional[st
     chunk counts, standing in for Baolian parsing, OCR, embedding and indexing.
     """
 
-    ext = extension_for(filename)
-    if ext in TEXT_EXTENSIONS:
-        text = payload.decode("utf-8", errors="replace").strip()
-        if text:
-            # Keep paragraph/row boundaries where possible, then account for
-            # long lines so the result behaves like a chunking stage.
-            units = [line.strip() for line in text.replace("\r\n", "\n").split("\n") if line.strip()]
-            chars = len(text)
-            chunks = max(len(units), math.ceil(chars / 800)) if units else 1
-            preview = text[:240]
-            return chunks, preview
-        return 1, None
-
-    # Approximate how many chunks a real parser would produce.  A small file
-    # always yields one chunk so that a successful upload is queryable.
-    if ext in {".png", ".jpg", ".jpeg", ".webp"}:
-        return 1, "图片内容将由云端 OCR 提取为文本。"
-    if ext == ".pdf":
-        return max(1, math.ceil(len(payload) / 80_000)), None
-    if ext == ".docx":
-        return max(1, math.ceil(len(payload) / 65_000)), None
-    if ext == ".xlsx":
-        return max(1, math.ceil(len(payload) / 35_000)), None
-    return max(1, math.ceil(len(payload) / 80_000)), None
+    text, _ = extract_document_text(filename, payload)
+    return len(chunk_text(text)), text[:240] if text else None
 
 
 def public_upload(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -178,7 +269,55 @@ def public_upload(record: Dict[str, Any]) -> Dict[str, Any]:
         "content_type": record["content_type"],
         "task_id": record["task_id"],
         "error": record.get("error"),
+        "pipeline": record.get("pipeline", []),
     }
+
+
+def retrieve(kb_id: str, query: str, limit: int = 5) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Run the local analogue of embedding retrieval + reranking."""
+    started = time.perf_counter()
+    query_vector = embedding(query)
+    terms = set(tokenize(query))
+    candidates: List[Dict[str, Any]] = []
+    with STATE_LOCK:
+        for chunk in CHUNKS.values():
+            if chunk.get("knowledge_base_id") != kb_id:
+                continue
+            lexical = sum(1 for term in terms if term in set(tokenize(chunk.get("text", ""))))
+            vector_score = max(0.0, cosine(query_vector, chunk.get("embedding", [])))
+            candidates.append({**chunk, "vector_score": vector_score, "lexical_score": lexical})
+    candidates.sort(key=lambda item: (item["vector_score"], item["lexical_score"]), reverse=True)
+    recalled = candidates[: min(20, len(candidates))]
+    # Rerank favors exact lexical matches, then semantic similarity.
+    for item in recalled:
+        item["rerank_score"] = min(0.99, 0.35 * item["vector_score"] + 0.65 * min(1.0, item["lexical_score"] / max(1, len(terms))))
+    recalled.sort(key=lambda item: item["rerank_score"], reverse=True)
+    # A local simulator should still model the most important RAG guardrail:
+    # low-confidence context must not be passed to the answer stage. Exact
+    # lexical overlap is accepted; otherwise require a modest semantic score.
+    recalled = [item for item in recalled if item["lexical_score"] > 0 or item["vector_score"] >= 0.2]
+    hits = []
+    for item in recalled[:limit]:
+        doc = UPLOADS.get(item["document_id"])
+        if not doc:
+            continue
+        hits.append({
+            "chunk_id": item["id"],
+            "document_id": doc["id"],
+            "document": public_upload(doc),
+            "score": round(item["rerank_score"], 4),
+            "content": item["text"],
+            "source": item["source"],
+        })
+    trace = {
+        "stages": [
+            {"name": "embedding", "provider": "local-simulated-embedding", "dimensions": 64},
+            {"name": "retrieval", "candidates": len(candidates), "recalled": len(recalled)},
+            {"name": "rerank", "model": "local-simulated-rerank", "returned": len(hits)},
+        ],
+        "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+    }
+    return hits, trace
 
 
 def process_upload(upload_id: str) -> None:
@@ -217,7 +356,8 @@ def process_upload(upload_id: str) -> None:
 
     time.sleep(0.12)
     try:
-        chunks, preview = extract_text_chunks(filename, payload)
+        text, metadata = extract_document_text(filename, payload)
+        chunks = chunk_text(text)
     except Exception as exc:  # defensive: a malformed payload must not kill the worker
         with STATE_LOCK:
             record = UPLOADS.get(upload_id)
@@ -236,15 +376,28 @@ def process_upload(upload_id: str) -> None:
         record = UPLOADS.get(upload_id)
         if record is None:
             return
+        # Simulate the full ingestion stages while keeping the adapter local:
+        # OCR/parser -> chunk -> embedding -> index.  Each chunk stores its
+        # vector so retrieval can use the same interface as a real provider.
+        for old_id, old_chunk in list(CHUNKS.items()):
+            if old_chunk.get("document_id") == upload_id:
+                del CHUNKS[old_id]
+        build_chunks(record, text, metadata)
         record.update(
             status="completed",
             progress=100,
             retrievable=True,
-            chunks=chunks,
-            preview=preview,
+            chunks=len(chunks),
+            preview=text[:240] if text else None,
             error=None,
             completed_at=utc_now(),
             updated_at=utc_now(),
+            pipeline=[
+                {"name": "ocr_parser", "status": "completed", "mode": metadata.get("source_type", "local-simulation")},
+                {"name": "chunk", "status": "completed", "count": len(chunks), "max_chars": 500, "overlap": 60},
+                {"name": "embedding", "status": "completed", "provider": "local-simulated-embedding", "dimensions": 64},
+                {"name": "index", "status": "completed", "collection": record["knowledge_base_id"]},
+            ],
         )
 
 
@@ -288,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
                     "version": "0.1.0",
                     "uploads": uploads,
                     "knowledge_bases": knowledge_bases,
+                    "chunks": len(CHUNKS),
+                    "logs": len(LOGS),
                 }
             )
             return
@@ -314,6 +469,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"knowledge_base_id": kb_id, "total": len(documents), "documents": documents})
             return
 
+        if path == "/api/logs":
+            with STATE_LOCK:
+                logs = list(LOGS)
+            self._send_json({"total": len(logs), "logs": logs})
+            return
+
         self._error("接口不存在", HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API name
@@ -335,6 +496,11 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith(search_prefix) and path.endswith(search_suffix):
             kb_id = path[len(search_prefix) : -len(search_suffix)].strip("/")
             self._handle_search(kb_id)
+            return
+        chat_suffix = "/chat"
+        if path.startswith(search_prefix) and path.endswith(chat_suffix):
+            kb_id = path[len(search_prefix) : -len(chat_suffix)].strip("/")
+            self._handle_chat(kb_id)
             return
         if path != "/api/uploads":
             self._error("接口不存在", HTTPStatus.NOT_FOUND)
@@ -359,30 +525,69 @@ class Handler(BaseHTTPRequestHandler):
         if not query:
             self._error("query 不能为空")
             return
-        terms = [term.lower() for term in query.split() if term.strip()]
-        hits: List[Dict[str, Any]] = []
+        hits, trace = retrieve(kb_id, query, limit=20)
+        self._send_json({"knowledge_base_id": kb_id, "query": query, "hits": hits, "trace": trace})
+
+    def _read_json_body(self) -> Optional[Dict[str, Any]]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            value = json.loads(body.decode("utf-8")) if body else {}
+            return value if isinstance(value, dict) else None
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    def _handle_chat(self, kb_id: str) -> None:
+        if "application/json" not in self.headers.get("Content-Type", "").lower():
+            self._error("对话请求请使用 application/json", HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+        value = self._read_json_body()
+        if value is None:
+            self._error("JSON 请求无效")
+            return
+        query = str(value.get("query", "")).strip()
+        if not query:
+            self._error("query 不能为空")
+            return
+        started = time.perf_counter()
+        hits, retrieval_trace = retrieve(kb_id, query, limit=int(value.get("top_k", 5) or 5))
+        if hits:
+            answer = "根据知识库资料，" + "；".join(hit["content"][:180] for hit in hits[:3])
+            answer += "。"
+        else:
+            answer = "当前知识库没有找到足够的依据，请补充资料或换一种问法。"
+        input_tokens = max(1, len(tokenize(query)) + sum(len(tokenize(hit["content"])) for hit in hits[:3]))
+        output_tokens = max(1, len(tokenize(answer)))
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        trace = {
+            "stages": retrieval_trace["stages"] + [{"name": "llm", "model": "local-simulated-llm", "streaming": False}],
+            "latency_ms": latency_ms,
+        }
+        log = {
+            "id": "log_" + uuid.uuid4().hex[:16],
+            "query": query,
+            "knowledge_base_id": kb_id,
+            "model": "local-simulated-llm",
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "latency_ms": latency_ms,
+            "status": "success",
+            "created_at": utc_now(),
+            "citations": [hit["source"] for hit in hits],
+        }
         with STATE_LOCK:
-            ids = list(UPLOADS_BY_KB.get(kb_id, []))
-            for item in ids:
-                record = UPLOADS.get(item)
-                if not record or record["status"] != "completed":
-                    continue
-                preview = (record.get("preview") or "").lower()
-                filename = record["filename"].lower()
-                score = sum(1 for term in terms if term in preview or term in filename)
-                if score or not terms:
-                    doc = public_upload(record)
-                    hits.append(
-                        {
-                            "document_id": doc["id"],
-                            "document": doc,
-                            "score": round(min(0.99, 0.55 + 0.12 * score), 2),
-                            "content": record.get("preview") or "模拟解析片段：该文档已完成解析，可接入百炼检索。",
-                            "source": {"name": doc["name"], "page": None, "sheet": None},
-                        }
-                    )
-        hits.sort(key=lambda hit: hit["score"], reverse=True)
-        self._send_json({"knowledge_base_id": kb_id, "query": query, "hits": hits[:20]})
+            LOGS.insert(0, log)
+        self._send_json({
+            "knowledge_base_id": kb_id,
+            "query": query,
+            "answer": answer,
+            "citations": hits,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": input_tokens + output_tokens},
+            "latency_ms": latency_ms,
+            "trace": trace,
+            "log_id": log["id"],
+        })
 
     def _handle_multipart_upload(self, forced_kb_id: Optional[str]) -> None:
 

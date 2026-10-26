@@ -91,7 +91,7 @@ curl http://127.0.0.1:8000/api/knowledge-bases/demo-kb/documents
 
 ### 本地模拟检索
 
-只对已完成解析的文档做简单的文件名/Markdown/CSV 文本匹配，接口形状用于联调，不能代替百炼召回、Embedding 或 Rerank：
+已完成解析的文档会经过一条可观测的本地模拟 RAG 链路：确定性 Embedding → 向量召回 → 词法/语义模拟 Rerank。接口形状用于联调，不能代替真实模型：
 
 ```bash
 curl -H 'Content-Type: application/json' \
@@ -99,7 +99,25 @@ curl -H 'Content-Type: application/json' \
      http://127.0.0.1:8000/api/knowledge-bases/demo-kb/search
 ```
 
-返回 `{ "knowledge_base_id", "query", "hits": [...] }`。每个 hit 含 `document_id`、`document`、`score`、`content` 和 `source`（示例中 `page`/`sheet` 可能为 `null`）。
+返回 `{ "knowledge_base_id", "query", "hits": [...], "trace": {"stages": [...] } }`。每个 hit 含 `chunk_id`、`document_id`、`document`、`score`、`content` 和 `source`。
+
+### 本地模拟对话
+
+```bash
+curl -H 'Content-Type: application/json' \
+     -d '{"query":"年假可以跨年使用吗？","top_k":5}' \
+     http://127.0.0.1:8000/api/knowledge-bases/demo-kb/chat
+```
+
+对话接口会执行：检索 → Rerank → 本地模拟 LLM，并返回 `answer`、`citations`、`usage`、`latency_ms`、`trace` 和 `log_id`。当没有足够依据时，回答会明确拒答，不会凭空补充。
+
+### 运行日志
+
+```bash
+curl http://127.0.0.1:8000/api/logs
+```
+
+每条日志包含原始问题、知识库、模拟模型、输入/输出/总 Tokens、耗时、状态和引用。
 
 ### 查询知识库文档
 
@@ -109,4 +127,6 @@ curl http://127.0.0.1:8000/api/knowledge-bases/demo-kb/documents
 
 返回 `knowledge_base_id`、`total` 和 `documents`。文档数组包含所有状态的上传记录，文件完成解析后会带有 `retrievable: true` 和大于等于 1 的 `chunks`。
 
-首版接受 `PDF`、`DOCX`、`MD/Markdown`、`PNG/JPG/JPEG/WEBP`、`CSV` 和 `XLSX`。文本类文件会尝试按 UTF-8 读取并按内容长度估算片段数；PDF、Word、表格和图片使用文件类型及大小生成确定性的模拟片段数，代表未来的解析/OCR/切片阶段。
+首版接受 `PDF`、`DOCX`、`MD/Markdown`、`PNG/JPG/JPEG/WEBP`、`CSV` 和 `XLSX`。Markdown/CSV 会读取真实文本；DOCX/XLSX 使用标准 ZIP/XML 做基础提取；PDF、扫描 PDF 和图片走可替换的本地 OCR/解析占位适配器。每个文档会返回 `pipeline` 字段，展示 `ocr_parser → chunk → embedding → index` 的导入阶段。
+
+当前实现仍是零依赖模拟版本：Embedding、Rerank、LLM 不调用外部模型，上传内容与日志只保存在内存中，服务重启后清空。后续可以在这些适配边界替换真实服务或 LangChain 编排，而不改变前端接口。
