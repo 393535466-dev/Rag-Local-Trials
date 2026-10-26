@@ -1,6 +1,6 @@
 # 本地模拟后端
 
-这是给前端原型使用的零依赖 Python 模拟后端。它不调用百炼，也不把文件写入磁盘；上传记录和文件内容只保存在当前进程内存中，服务重启后会清空。后续接入真实百炼 RAG 时，可保留这些接口作为前端边界。
+这是给前端原型使用的零依赖 Python 模拟后端。它不调用百炼，使用本地 SQLite 和 `data/uploads/` 保存文档、知识片段、Embedding 与日志；服务重启后会自动恢复。后续接入真实百炼 RAG 时，可保留这些接口作为前端边界。
 
 ## 启动
 
@@ -129,4 +129,4 @@ curl http://127.0.0.1:8000/api/knowledge-bases/demo-kb/documents
 
 首版接受 `PDF`、`DOCX`、`MD/Markdown`、`PNG/JPG/JPEG/WEBP`、`CSV` 和 `XLSX`。Markdown/CSV 会读取真实文本；DOCX/XLSX 使用标准 ZIP/XML 做基础提取；PDF、扫描 PDF 和图片走可替换的本地 OCR/解析占位适配器。每个文档会返回 `pipeline` 字段，展示 `ocr_parser → chunk → embedding → index` 的导入阶段。
 
-当前实现仍是零依赖模拟版本：Embedding、Rerank、LLM 不调用外部模型，上传内容与日志只保存在内存中，服务重启后清空。后续可以在这些适配边界替换真实服务或 LangChain 编排，而不改变前端接口。
+当前实现仍是零依赖模拟版本：Embedding、Rerank、LLM 不调用外部模型。文档、知识片段和日志会持久化到本地，`data/` 不会提交到 Git。后续可以在这些适配边界替换真实服务或 LangChain 编排，而不改变前端接口。

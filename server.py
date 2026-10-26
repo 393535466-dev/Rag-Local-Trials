@@ -19,6 +19,7 @@ import json
 import math
 import mimetypes
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -30,6 +31,7 @@ from email.parser import BytesParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import PurePath
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
@@ -59,6 +61,154 @@ UPLOADS_BY_KB: Dict[str, List[str]] = {}
 CHUNKS: Dict[str, Dict[str, Any]] = {}
 LOGS: List[Dict[str, Any]] = []
 STATE_LOCK = threading.RLock()
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+UPLOAD_DIR = DATA_DIR / "uploads"
+DB_PATH = DATA_DIR / "rag.sqlite3"
+STORAGE_READY = False
+
+
+def db_connect() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(DB_PATH), timeout=30)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_storage() -> None:
+    """Create the local durable store and hydrate the in-memory index."""
+    global STORAGE_READY
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    with db_connect() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                knowledge_base_id TEXT NOT NULL,
+                field TEXT,
+                filename TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                icon TEXT NOT NULL,
+                content_type TEXT,
+                size_bytes INTEGER NOT NULL,
+                task_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                progress INTEGER NOT NULL DEFAULT 0,
+                retrievable INTEGER NOT NULL DEFAULT 0,
+                chunks INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                error TEXT,
+                file_path TEXT NOT NULL,
+                preview TEXT,
+                pipeline_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE INDEX IF NOT EXISTS idx_documents_kb ON documents(knowledge_base_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS chunks (
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                knowledge_base_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                embedding_json TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                source_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chunks_kb ON chunks(knowledge_base_id);
+            CREATE TABLE IF NOT EXISTS logs (
+                id TEXT PRIMARY KEY,
+                query TEXT NOT NULL,
+                knowledge_base_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                latency_ms REAL NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                citations_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at DESC);
+            """
+        )
+    load_storage_state()
+    STORAGE_READY = True
+    # A process can stop between the queued/processing stages. Resume those
+    # tasks on the next start instead of leaving them permanently stuck.
+    with STATE_LOCK:
+        pending_ids = [
+            item["id"] for item in UPLOADS.values()
+            if item.get("status") in {"queued", "processing"} and item.get("payload")
+        ]
+    for upload_id in pending_ids:
+        threading.Thread(target=process_upload, args=(upload_id,), daemon=True).start()
+
+
+def load_storage_state() -> None:
+    """Hydrate the process cache after startup so existing data is usable."""
+    with STATE_LOCK, db_connect() as connection:
+        UPLOADS.clear()
+        UPLOADS_BY_KB.clear()
+        CHUNKS.clear()
+        LOGS.clear()
+        for row in connection.execute("SELECT * FROM documents ORDER BY created_at DESC"):
+            file_path = Path(row["file_path"])
+            payload = file_path.read_bytes() if file_path.exists() else b""
+            record = {
+                "id": row["id"], "knowledge_base_id": row["knowledge_base_id"], "field": row["field"],
+                "filename": row["filename"], "kind": row["kind"], "icon": row["icon"],
+                "content_type": row["content_type"] or "application/octet-stream", "size_bytes": row["size_bytes"],
+                "task_id": row["task_id"], "status": row["status"], "progress": row["progress"],
+                "retrievable": bool(row["retrievable"]), "chunks": row["chunks"], "created_at": row["created_at"],
+                "updated_at": row["updated_at"], "completed_at": row["completed_at"], "error": row["error"],
+                "file_path": str(file_path), "payload": payload, "preview": row["preview"],
+                "pipeline": json.loads(row["pipeline_json"] or "[]"),
+            }
+            UPLOADS[record["id"]] = record
+            UPLOADS_BY_KB.setdefault(record["knowledge_base_id"], []).append(record["id"])
+        for row in connection.execute("SELECT * FROM chunks"):
+            CHUNKS[row["id"]] = {
+                "id": row["id"], "document_id": row["document_id"], "knowledge_base_id": row["knowledge_base_id"],
+                "text": row["text"], "embedding": json.loads(row["embedding_json"]), "index": row["chunk_index"],
+                "source": json.loads(row["source_json"]),
+            }
+        for row in connection.execute("SELECT * FROM logs ORDER BY created_at DESC"):
+            LOGS.append({
+                "id": row["id"], "query": row["query"], "knowledge_base_id": row["knowledge_base_id"],
+                "model": row["model"], "input_tokens": row["input_tokens"], "output_tokens": row["output_tokens"],
+                "total_tokens": row["total_tokens"], "latency_ms": row["latency_ms"], "status": row["status"],
+                "created_at": row["created_at"], "citations": json.loads(row["citations_json"] or "[]"),
+            })
+
+
+def persist_document(record: Dict[str, Any]) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            """INSERT OR REPLACE INTO documents
+            (id,knowledge_base_id,field,filename,kind,icon,content_type,size_bytes,task_id,status,progress,retrievable,chunks,created_at,updated_at,completed_at,error,file_path,preview,pipeline_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (record["id"], record["knowledge_base_id"], record.get("field"), record["filename"], record["kind"], record["icon"], record.get("content_type"), record["size_bytes"], record["task_id"], record["status"], record["progress"], int(record["retrievable"]), record["chunks"], record["created_at"], record["updated_at"], record.get("completed_at"), record.get("error"), record["file_path"], record.get("preview"), json.dumps(record.get("pipeline", []), ensure_ascii=False)),
+        )
+
+
+def persist_chunks_for_document(document_id: str) -> None:
+    with db_connect() as connection:
+        connection.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+        for chunk in CHUNKS.values():
+            if chunk.get("document_id") != document_id:
+                continue
+            connection.execute(
+                "INSERT OR REPLACE INTO chunks (id,document_id,knowledge_base_id,text,embedding_json,chunk_index,source_json) VALUES (?,?,?,?,?,?,?)",
+                (chunk["id"], chunk["document_id"], chunk["knowledge_base_id"], chunk["text"], json.dumps(chunk["embedding"]), chunk["index"], json.dumps(chunk["source"], ensure_ascii=False)),
+            )
+
+
+def persist_log(log: Dict[str, Any]) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO logs (id,query,knowledge_base_id,model,input_tokens,output_tokens,total_tokens,latency_ms,status,created_at,citations_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (log["id"], log["query"], log["knowledge_base_id"], log["model"], log["input_tokens"], log["output_tokens"], log["total_tokens"], log["latency_ms"], log["status"], log["created_at"], json.dumps(log.get("citations", []), ensure_ascii=False)),
+        )
 
 
 def utc_now() -> str:
@@ -332,6 +482,7 @@ def process_upload(upload_id: str) -> None:
         record["status"] = "processing"
         record["progress"] = 15
         record["updated_at"] = utc_now()
+        persist_document(record)
     time.sleep(0.12)
 
     with STATE_LOCK:
@@ -350,9 +501,11 @@ def process_upload(upload_id: str) -> None:
                 error=f"暂不支持 {extension or '该文件类型'}，首版支持 PDF、DOCX、MD、图片、CSV 和 XLSX",
                 updated_at=utc_now(),
             )
+            persist_document(record)
             return
         record["progress"] = 55
         record["updated_at"] = utc_now()
+        persist_document(record)
 
     time.sleep(0.12)
     try:
@@ -370,6 +523,7 @@ def process_upload(upload_id: str) -> None:
                     error=f"解析失败：{exc}",
                     updated_at=utc_now(),
                 )
+                persist_document(record)
         return
 
     with STATE_LOCK:
@@ -399,6 +553,8 @@ def process_upload(upload_id: str) -> None:
                 {"name": "index", "status": "completed", "collection": record["knowledge_base_id"]},
             ],
         )
+        persist_document(record)
+        persist_chunks_for_document(upload_id)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -578,6 +734,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         with STATE_LOCK:
             LOGS.insert(0, log)
+            persist_log(log)
         self._send_json({
             "knowledge_base_id": kb_id,
             "query": query,
@@ -656,10 +813,15 @@ class Handler(BaseHTTPRequestHandler):
                 "updated_at": now,
                 "payload": payload,
                 "preview": None,
+                "pipeline": [],
             }
+            file_path = UPLOAD_DIR / f"{upload_id}{extension_for(filename)}"
+            file_path.write_bytes(payload)
+            record["file_path"] = str(file_path)
             with STATE_LOCK:
                 UPLOADS[upload_id] = record
                 UPLOADS_BY_KB.setdefault(kb_id, []).append(upload_id)
+                persist_document(record)
             worker = threading.Thread(target=process_upload, args=(upload_id,), daemon=True)
             worker.start()
             created.append(public_upload(record))
@@ -674,6 +836,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run(host: str = HOST, port: int = PORT) -> None:
+    initialize_storage()
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"RAG prototype backend listening on http://{host}:{port}")
     print("Press Ctrl-C to stop.")
